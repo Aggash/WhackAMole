@@ -1,0 +1,528 @@
+#include <cmsis_os2.h>
+#include <LPC17xx.h>
+#include "stdio.h"
+#include "stdlib.h"
+#include "stdbool.h"
+#include "GLCD.h"
+#include "uart.h"
+#include "art.c"
+
+int potentVal = 4000; //potentiometer value
+int joyVal; //joystick direction 0 = not pressed, 1 = pressed, 2 = up, 3 = left, 4 = down, 5 = right
+int currentBurrow = 1; //integers from 1 to 9 representing position of currently selected burrow
+int firedBurrow = 9;
+bool pushVal = false; //is push button pressed?
+bool gameOver = true; //is gameover?
+int score = 0;
+
+char scoreString[10];
+char difficultyText[15];
+int molePosition = 9; //integers from 1 to 9 represent random position of mole
+int hammerPos = 1; //Use to decrement hammer down
+int xAdd=0; //Used to position hammer
+int yAdd=0; //Used to position hammer
+int xMoleAdd=0; //Used to position mole
+int yMoleAdd=0; //Used to position mole
+int moleLoc = 0; //Used to increment mole up and down
+int xLetterAdd = 0; //Used to position cursor
+int yLetterAdd = 0; //Used to position cursor
+int gamesPlayed = 0; //Number of games played
+bool showHammer = false; //Show hammer or not?
+bool timeToDisplayHammer = false; //used to ensure dispHammer doesn't starve
+bool timeToIncrementHammer = false; //used to ensure dispLCD doesn't starve
+bool showMole; //show mole or not?
+bool timeToDisplayMole = false; //used to ensure dispMole doesn't starve
+bool timeToIncrementMole = false; //used to ensure dispLCD doesn't starve
+bool moleGoDown = true; //is mole moving up or down?
+bool clearScreen = false; //used to clear the screen from the logic thread for the start of a new game
+int currentTime = 0; //stores current time to compare to time when mole is first visible
+int releaseTime = 0; //stores the sysTicks value when the mole is first visibile (used to eliminate user via timeout)
+int difficulty = 10000; 
+int displayDifficulty = 1;
+bool timeout = false; // user took too much time to select mole
+int prevYAdd = 0; //used to clear previous mole if user is fast
+int prevXAdd = 0; //used to clear previous mole if user is fast
+int prevPrevYAdd = 0; //used to clear previous mole if user is fast
+int prevPrevXAdd = 0; //used to clear previous mole if user is fast
+bool prevNotCleared = false; //used to clear previous mole if user is fast
+
+osMutexId_t mutex_joyVal; //mutex protecting joystick value
+osMutexId_t mutex_pushVal; //mutex protecting push button value
+osMutexId_t mutex_gameOver; //mutex protecting gameover boolean
+osMutexId_t mutex_molePosition; //mutex protecting molePosition value
+osMutexId_t mutex_displayMole; //mutex to protect mole position
+osMutexId_t mutex_potentiometer; // mutext to protect potentVal
+
+
+void potentiometerValue() {
+	while (1) {
+		osMutexAcquire(mutex_potentiometer, osWaitForever);
+		
+		LPC_PINCON->PINSEL1 &= ~(0x03<<18);
+		LPC_PINCON->PINSEL1 |= (0x01<<18);
+		LPC_SC->PCONP |= 0x1000;
+		LPC_ADC->ADCR = (1 << 2) | (4 << 8) | (1 << 21);
+		LPC_ADC->ADCR |= 0x1000000;
+		while(!(LPC_ADC->ADGDR & 0x80000000)){
+			osMutexRelease(mutex_potentiometer);				
+			osThreadYield();
+		}
+		potentVal = (LPC_ADC->ADGDR & 0xFFF0) >> 4;
+		
+		osMutexRelease(mutex_potentiometer);				
+		osThreadYield();
+	}
+}
+
+
+void joystickValue(){
+	while(1){
+		osMutexAcquire(mutex_joyVal, osWaitForever);
+		osMutexAcquire(mutex_pushVal, osWaitForever);
+		osMutexAcquire(mutex_displayMole, osWaitForever);
+		osMutexAcquire(mutex_gameOver, osWaitForever);
+		
+		//joystick direction 0 = not pressed, 1 = pressed, 2 = up, 3 = left, 4 = down, 5 = right
+		int joyValOld = joyVal;
+		if ((LPC_GPIO1->FIOPIN & 0x04000000) == 0)
+			joyVal = 2; //down
+		else if ((LPC_GPIO1->FIOPIN & 0x02000000) == 0)
+			joyVal = 3; //right
+		else if ((LPC_GPIO1->FIOPIN & 0x01000000) == 0)
+			joyVal = 4; //up
+		else if ((LPC_GPIO1->FIOPIN & 0x00800000) == 0)
+			joyVal = 5; //left
+		else if ((LPC_GPIO1->FIOPIN & 0x00100000) == 0)
+			joyVal = 1;
+		else
+			joyVal = 0;
+		if (joyValOld == 0 && joyVal != joyValOld)
+		{
+			if (joyVal == 5){
+				if (currentBurrow<=3){
+					currentBurrow = currentBurrow + 6;
+				}
+				else{
+					currentBurrow = currentBurrow -3;
+				}	
+			}
+			else if (joyVal == 3){
+				if (currentBurrow>=7){
+					currentBurrow = currentBurrow - 6;
+				}
+				else{
+					currentBurrow = currentBurrow +3;
+				}	
+			}
+			else if (joyVal == 4){
+				if ((currentBurrow%3)==0){
+					currentBurrow = currentBurrow - 2;
+				}
+				else{
+					currentBurrow = currentBurrow +1;
+				}	
+			}
+			else if (joyVal == 2){
+				if (((currentBurrow-1)%3)==0){
+					currentBurrow = currentBurrow +2;
+				}
+				else{
+					currentBurrow = currentBurrow -1;
+				}	
+			}
+			else if ((joyVal == 1)&&(!gameOver)){
+				firedBurrow = currentBurrow;
+				//Clear previous hammer
+				if(showHammer){
+					prevNotCleared = true;
+				}
+				//Display hammer
+				showHammer = true;
+				if ((firedBurrow == 1)||(firedBurrow == 4)||(firedBurrow == 7)){
+					xAdd = 0;
+				}
+				else if ((firedBurrow == 2)||(firedBurrow == 5)||(firedBurrow == 8)){
+					xAdd = 120;
+				}
+				else if ((firedBurrow == 3)||(firedBurrow == 6)||(firedBurrow == 9)){
+					xAdd = 240;
+				}			
+				if ((firedBurrow == 1)||(firedBurrow == 2)||(firedBurrow == 3)){
+					yAdd = 0;
+				}
+				else if ((firedBurrow == 4)||(firedBurrow == 5)||(firedBurrow == 6)){
+					yAdd = 80;
+				}
+				else if ((firedBurrow == 7)||(firedBurrow == 8)||(firedBurrow == 9)){
+					yAdd = 160;
+				}
+				if (firedBurrow == molePosition){
+					score++;
+					prevPrevXAdd = prevXAdd;
+					prevPrevYAdd = prevYAdd;
+					prevXAdd = xAdd;
+					prevYAdd = yAdd;
+					molePosition = (rand()%9);
+					if (molePosition == 0){
+						molePosition++;
+					}
+					showMole = true;
+					releaseTime = osKernelGetTickCount();
+					
+					if((difficulty-100)<1820){
+						difficulty = 1820;
+					}
+					else {
+						difficulty = difficulty - 100;
+					}
+				}
+				else {
+					gameOver = true;
+				}
+			}
+		}
+			
+		osMutexRelease(mutex_gameOver);
+		osMutexRelease(mutex_pushVal);
+		osMutexRelease(mutex_displayMole);
+		osMutexRelease(mutex_joyVal);
+		osThreadYield();
+	}
+}
+
+
+void buttonValueandDispHammer(){
+	while(1){
+		osMutexAcquire(mutex_pushVal, osWaitForever);
+
+		uint32_t buttonPressed = (LPC_GPIO2->FIOPIN & 0x400);
+		if(!buttonPressed){
+			pushVal = true;
+		}
+		else {
+			pushVal = false;
+		}
+		if (showHammer == true){
+			while(hammerPos<11){
+				if ((timeToIncrementHammer == true)||(hammerPos == 1)) {
+					hammerPos+=3;
+					timeToDisplayHammer = true;
+					timeToIncrementHammer = false;
+				}
+			}
+			hammerPos = 1;
+			showHammer = false;
+		}
+		
+		osMutexRelease(mutex_pushVal);
+		osDelay(osKernelGetTickFreq()/(10*5));
+	}
+}
+
+
+void cursor(){
+	//Burrow 1
+	//Top left
+	GLCD_DisplayString(1+yLetterAdd, 2+xLetterAdd, 0, "*");
+	GLCD_DisplayString(1+yLetterAdd, 1+xLetterAdd, 0, "*");
+	GLCD_DisplayString(2+yLetterAdd, 1+xLetterAdd, 0, "*");
+	//Top right
+	GLCD_DisplayString(1+yLetterAdd, 11+xLetterAdd, 0, "*");
+	GLCD_DisplayString(1+yLetterAdd, 12+xLetterAdd, 0, "*");
+	GLCD_DisplayString(2+yLetterAdd, 12+xLetterAdd, 0, "*");
+	//Bot left
+	GLCD_DisplayString(8+yLetterAdd, 2+xLetterAdd, 0, "*");
+	GLCD_DisplayString(8+yLetterAdd, 1+xLetterAdd, 0, "*");
+	GLCD_DisplayString(7+yLetterAdd, 1+xLetterAdd, 0, "*");
+	//Bot right
+	GLCD_DisplayString(8+yLetterAdd, 11+xLetterAdd, 0, "*");
+	GLCD_DisplayString(8+yLetterAdd, 12+xLetterAdd, 0, "*");
+	GLCD_DisplayString(7+yLetterAdd, 12+xLetterAdd, 0, "*");
+}
+
+
+void displayLCD(){
+	while(1){
+		osMutexAcquire(mutex_molePosition, osWaitForever);
+		osMutexAcquire(mutex_gameOver, osWaitForever);
+		osMutexAcquire(mutex_pushVal, osWaitForever);
+		osMutexAcquire(mutex_displayMole, osWaitForever);
+	
+		if(clearScreen){
+			GLCD_Clear(Green);
+			clearScreen = false;
+		}	
+		//Message when first playing
+		if (gameOver&&(gamesPlayed==0)){
+			GLCD_SetTextColor(Black); //Set font colour
+			GLCD_DisplayString(61, 16, 0, "Press button to play.");
+		}
+		//Game over message
+		else if (gameOver&&(gamesPlayed!=0)&&(timeout==true)){
+			GLCD_SetTextColor(Black);
+			GLCD_DisplayString(61, 9, 0, "Time up! Press button to play again.");
+		}
+		else if (gameOver&&(gamesPlayed!=0)&&(timeout==false)){
+			GLCD_SetTextColor(Black);
+			GLCD_DisplayString(61, 7, 0, "Wrong burrow! Press button to play again.");
+		}
+		//Remove game over message
+		else {
+			GLCD_SetTextColor(Green); //Set font colour
+			GLCD_DisplayString(61, 16, 0, "Press button to play.");
+			GLCD_DisplayString(61, 9, 0, "Time up! Press button to play again.");
+			GLCD_DisplayString(61, 7, 0, "Wrong burrow! Press button to play again.");
+			GLCD_SetTextColor(Black); //Set font colour
+		}		
+		//Score
+		GLCD_SetTextColor(Black); //Set font colour
+		sprintf(scoreString, "Score: %d", score);
+		GLCD_DisplayString(0, 42, 0, scoreString);
+		sprintf(difficultyText, "Difficulty: %d", displayDifficulty);
+		GLCD_DisplayString(0, 2, 0, difficultyText);
+		//Cursors
+		for (int k=1; k<=9; k++){
+			GLCD_SetTextColor(Green); //Set font colour for un-used cursors to green (same as background)
+			if ((k == 1)||(k == 4)||(k == 7)){
+				xLetterAdd = 0;
+			}
+			else if ((k == 2)||(k == 5)||(k == 8)){
+				xLetterAdd = 20;
+			}
+			else if ((k == 3)||(k == 6)||(k == 9)){
+				xLetterAdd = 40;
+			}			
+			if ((k == 1)||(k == 2)||(k == 3)){
+				yLetterAdd = 0;
+			}
+			else if ((k == 4)||(k == 5)||(k == 6)){
+				yLetterAdd = 10;
+			}
+			else if ((k == 7)||(k == 8)||(k == 9)){
+				yLetterAdd = 20;
+			}		
+			if (k == currentBurrow){
+				GLCD_SetTextColor(Red); //Set font colour for cursor
+			}
+			cursor();
+		}
+		for (int k = 0; k<=160; k+=80){
+			for (int n=0; n<=3; n++){
+				//Burrow 1
+				GLCD_Bitmap(10+(15*n), 40+k, 15, 15, (unsigned char*)&Burrow);
+				//Burrow 2
+				GLCD_Bitmap(130+(15*n), 40+k, 15, 15, (unsigned char*)&Burrow);
+				//Burrow 3
+				GLCD_Bitmap(250+(15*n), 40+k, 15, 15, (unsigned char*)&Burrow);
+			}
+		}		
+		//Clear mole after joystick is pressed
+		if (hammerPos == 10){
+			for (int n = 0; n < 18; n++){
+				GLCD_Bitmap(25+xAdd, 20+n+yAdd-moleLoc, 15, 2, (unsigned char*)&greenHammer);
+				GLCD_Bitmap(35+xAdd, 20+n+yAdd-moleLoc, 15, 2, (unsigned char*)&greenHammer);
+			}
+		}
+		//Mole
+		if ((molePosition == 1)||(molePosition == 4)||(molePosition == 7)){
+			xMoleAdd = 0;
+		}
+		else if ((molePosition == 2)||(molePosition == 5)||(molePosition == 8)){
+			xMoleAdd = 120;
+		}
+		else if ((molePosition == 3)||(molePosition == 6)||(molePosition == 9)){
+			xMoleAdd = 240;
+		}			
+			
+		if ((molePosition == 1)||(molePosition == 2)||(molePosition == 3)){
+			yMoleAdd = 0;
+		}
+		else if ((molePosition == 4)||(molePosition == 5)||(molePosition == 6)){
+			yMoleAdd = 80;
+		}
+		else if ((molePosition == 7)||(molePosition == 8)||(molePosition == 9)){
+			yMoleAdd = 160;
+		}
+		
+		if ((timeToDisplayMole == true)&&((moleLoc!=10)||(moleLoc!=0))){
+			GLCD_Bitmap(30+xMoleAdd, 21+yMoleAdd-moleLoc, 19, 19, (unsigned char*)&molePic);
+			
+			if ((moleLoc>1)&&(moleGoDown)){
+				GLCD_Bitmap(30+xMoleAdd, 21+yMoleAdd-moleLoc+19, 15, 2, (unsigned char*)&greenHammer);
+				GLCD_Bitmap(44+xMoleAdd, 21+yMoleAdd-moleLoc+19, 15, 2, (unsigned char*)&greenHammer);
+			}
+			if ((moleLoc<9)&&(!moleGoDown)){
+				GLCD_Bitmap(30+xMoleAdd, 21+yMoleAdd-moleLoc-2, 15, 2, (unsigned char*)&greenHammer);
+				GLCD_Bitmap(44+xMoleAdd, 21+yMoleAdd-moleLoc-2, 15, 2, (unsigned char*)&greenHammer);
+			}					
+			
+			timeToDisplayMole = false;
+			timeToIncrementMole = true;
+		}	
+		//Show hammer			
+		if ((timeToDisplayHammer == true)&&(hammerPos!=1)){
+			for (int n = 0; n < 18; n++){
+				if ((n==4)||(n==6)||(n==8)||(n==10)){
+					GLCD_Bitmap(30+xAdd, hammerPos+n+yAdd, 15, 2, (unsigned char*)&greenHammer);
+				}
+				if (n<11){
+					GLCD_Bitmap(37+xAdd, hammerPos+yAdd+n, 15, 2, (unsigned char*)&greenHammer);	
+				}
+				GLCD_Bitmap(45+xAdd, 10+yAdd+hammerPos+n, 15, 2, (unsigned char*)&greenHammer);
+				GLCD_Bitmap(45+xAdd, 10+yAdd+hammerPos+n, 15, 2, (unsigned char*)&greenHammer);
+			}
+			GLCD_Bitmap(30+xAdd, 10+yAdd+hammerPos, 21, 15, (unsigned char*)&Hammer);
+			GLCD_Bitmap(37+xAdd, 10+hammerPos+yAdd, 15, 2, (unsigned char*)&greenHammer);
+			timeToDisplayHammer = false;
+			timeToIncrementHammer = true;
+		}	
+		//Clear hammer after it has fallen
+		if (hammerPos == 10){
+			for (int k = 0; k<10; k++){
+				GLCD_Bitmap(30+xAdd, 20+yAdd+2*k, 15, 2, (unsigned char*)&greenHammer);
+				GLCD_Bitmap(37+xAdd, 20+yAdd+2*k, 15, 2, (unsigned char*)&greenHammer);
+			}
+		}
+		if(prevNotCleared){
+			for (int k = 6; k<20; k++){
+				for (int n = 0; n<=1; n++){
+					GLCD_Bitmap(30+prevPrevXAdd, prevPrevYAdd+2*k, 15, 2, (unsigned char*)&greenHammer);
+					GLCD_Bitmap(37+prevPrevXAdd, prevPrevYAdd+2*k, 15, 2, (unsigned char*)&greenHammer);
+				}
+			}
+			prevNotCleared = false;
+		}
+				
+		osMutexRelease(mutex_displayMole);
+		osMutexRelease(mutex_pushVal);
+		osMutexRelease(mutex_gameOver);
+		osMutexRelease(mutex_molePosition);
+		osDelay(osKernelGetTickFreq()/(10));
+	}
+}
+
+
+void gameLogic(){
+	while(1){
+		osMutexAcquire(mutex_molePosition, osWaitForever);
+		osMutexAcquire(mutex_joyVal, osWaitForever);
+		osMutexAcquire(mutex_gameOver, osWaitForever);
+		osMutexAcquire(mutex_displayMole, osWaitForever);
+		osMutexAcquire(mutex_gameOver, osWaitForever);
+		osMutexAcquire(mutex_potentiometer, osWaitForever);
+		
+		if(gameOver && (pushVal == true)){
+			GLCD_SetTextColor(Green);
+			GLCD_DisplayString(0, 23, 0, scoreString);
+			GLCD_SetTextColor(Black);
+			score = 0;
+			clearScreen = true;
+			timeout = false;
+			gameOver = false;
+			gamesPlayed++;
+			molePosition = (rand()%9);
+			if (molePosition == 0){
+				molePosition++;
+			}
+			showMole = true;			
+			releaseTime = osKernelGetTickCount();
+		}
+		if(gameOver){
+			if((potentVal<3688)&&(potentVal>408)){
+				int val = potentVal;
+				if((1820+2*(val))>1820){
+					difficulty = (1820+2*(val));				
+					displayDifficulty = 9-(val/408);
+				}
+			}
+			else if (potentVal >= 3688){
+				difficulty = 1820+(2*4096);
+				displayDifficulty =0;
+			}
+			else{
+				difficulty = 1820;
+				displayDifficulty = 9;
+			}
+		}
+		currentTime = osKernelGetTickCount();
+		if((!gameOver)&&(pushVal != true)&&(!showHammer)&&((currentTime - releaseTime)>difficulty)){
+			gameOver = true;
+			timeout = true;
+		}
+		
+		osMutexRelease(mutex_potentiometer);		
+		osMutexRelease(mutex_pushVal);
+		osMutexRelease(mutex_displayMole);
+		osMutexRelease(mutex_gameOver);
+		osMutexRelease(mutex_joyVal);
+		osMutexRelease(mutex_molePosition);
+		osThreadYield();
+	}
+}
+
+
+void dispMole(){
+	while(1){
+		osMutexAcquire(mutex_displayMole, osWaitForever);
+		
+		if (showMole == true){
+			if (moleGoDown == true){
+				while(moleLoc<10){
+					if ((timeToIncrementMole == true)||(moleLoc == 0)) {
+						moleLoc++;
+						timeToDisplayMole = true;
+						timeToIncrementMole = false;
+					}
+				}
+				moleGoDown = false;
+			}
+			else if (moleGoDown == false){ //Going up
+				while(moleLoc>0){
+					if ((timeToIncrementMole == true)||(moleLoc == 10)) {
+						moleLoc--;
+						timeToDisplayMole = true;
+						timeToIncrementMole = false;
+					}
+				}
+			moleGoDown = true;
+			}	
+
+		if ((timeToIncrementMole == true) && (timeToDisplayMole==true)){
+			}
+		}
+		
+		osMutexRelease(mutex_displayMole);
+		osDelay(osKernelGetTickFreq()/1000);
+	}
+}
+
+
+int main(void){
+	printf("Hello"); //Initialize UART
+	
+	GLCD_Init(); //Initialize LCD
+	GLCD_Clear(Green); //Set background colour
+	GLCD_SetBackColor(Green); //Set text background
+		
+
+	osMutexNew(mutex_joyVal);
+	osMutexNew(mutex_gameOver);
+	osMutexNew(mutex_molePosition);
+	osMutexNew(mutex_pushVal);
+	osMutexNew(mutex_displayMole);
+	osMutexNew(mutex_potentiometer);
+	
+	osKernelInitialize();
+	
+	osThreadNew(potentiometerValue,NULL,NULL);
+	osThreadNew(joystickValue,NULL,NULL);
+	osThreadNew(gameLogic,NULL,NULL);
+	osThreadNew(displayLCD,NULL,NULL);
+	osThreadNew(buttonValueandDispHammer,NULL,NULL);
+	osThreadNew(dispMole,NULL,NULL);
+
+	osKernelStart();
+	
+	while(1){
+	}
+}
